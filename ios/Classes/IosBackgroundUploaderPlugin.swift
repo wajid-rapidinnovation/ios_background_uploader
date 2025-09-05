@@ -1,4 +1,4 @@
-mport Flutter
+import Flutter
 import UIKit
 
 public class IosBackgroundUploaderPlugin: NSObject, FlutterPlugin, URLSessionDelegate, URLSessionTaskDelegate, URLSessionDataDelegate {
