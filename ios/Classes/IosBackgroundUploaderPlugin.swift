@@ -1,11 +1,17 @@
-import Flutter
+mport Flutter
 import UIKit
 
 public class IosBackgroundUploaderPlugin: NSObject, FlutterPlugin, URLSessionDelegate, URLSessionTaskDelegate, URLSessionDataDelegate {
+
+    // MARK: - Properties
     private var backgroundSession: URLSession!
     private static var eventSink: FlutterEventSink?
     private var responseDataMap = [Int: Data]() // Store data per task
 
+    // Static property to store the background session completion handler
+    public static var backgroundSessionCompletionHandler: (() -> Void)?
+
+    // MARK: - Plugin Registration
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "ios_background_uploader", binaryMessenger: registrar.messenger())
         let eventChannel = FlutterEventChannel(name: "ios_background_uploader/events", binaryMessenger: registrar.messenger())
@@ -15,20 +21,24 @@ public class IosBackgroundUploaderPlugin: NSObject, FlutterPlugin, URLSessionDel
         registrar.addMethodCallDelegate(instance, channel: channel)
     }
 
+    // MARK: - Init
     override init() {
         super.init()
         let config = URLSessionConfiguration.background(withIdentifier: "com.desireweb.iosuploader.customUploader")
         config.isDiscretionary = false
+        config.allowsCellularAccess = true
+        config.httpMaximumConnectionsPerHost = 100
         config.sessionSendsLaunchEvents = true
         backgroundSession = URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }
 
+    // MARK: - Method Call Handling
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
         case "uploadFiles":
             if let args = call.arguments as? [String: Any] {
                 startUpload(args: args)
-                result("upload_started") // Immediate ack
+                result("upload_started")
             } else {
                 result("invalid_arguments")
             }
@@ -37,6 +47,7 @@ public class IosBackgroundUploaderPlugin: NSObject, FlutterPlugin, URLSessionDel
         }
     }
 
+    // MARK: - Upload Logic
     private func startUpload(args: [String: Any]) {
         guard let urlString = args["url"] as? String,
               let url = URL(string: urlString),
@@ -56,38 +67,42 @@ public class IosBackgroundUploaderPlugin: NSObject, FlutterPlugin, URLSessionDel
             request.setValue(value, forHTTPHeaderField: key)
         }
 
-        let boundary = "Boundary-\(UUID().uuidString)"
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-
-        let body = createMultipartBody(files: files, fields: fields, boundary: boundary)
-
-        let tempDir = FileManager.default.temporaryDirectory
-        let bodyFileURL = tempDir.appendingPathComponent("upload-\(tag).tmp")
-        do {
-            try body.write(to: bodyFileURL)
-        } catch {
-            print("Error writing body: \(error)")
-            return
+        if files.count > 1 || !fields.isEmpty {
+            // Multipart form-data upload
+            let boundary = "Boundary-\(UUID().uuidString)"
+            request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+            let body = createMultipartBody(files: files, fields: fields, boundary: boundary)
+            let tempDir = FileManager.default.temporaryDirectory
+            let bodyFileURL = tempDir.appendingPathComponent("upload-\(tag).tmp")
+            do {
+                try body.write(to: bodyFileURL)
+            } catch {
+                print("Error writing body: \(error)")
+                return
+            }
+            let uploadTask = backgroundSession.uploadTask(with: request, fromFile: bodyFileURL)
+            uploadTask.taskDescription = tag
+            uploadTask.resume()
+        } else if let filePath = files.first {
+            // Single file upload
+            let fileURL = URL(fileURLWithPath: filePath)
+            let uploadTask = backgroundSession.uploadTask(with: request, fromFile: fileURL)
+            uploadTask.taskDescription = tag
+            uploadTask.resume()
         }
-
-        let uploadTask = backgroundSession.uploadTask(with: request, fromFile: bodyFileURL)
-        uploadTask.taskDescription = tag
-        uploadTask.resume()
     }
 
     private func createMultipartBody(files: [String], fields: [String: String], boundary: String) -> Data {
         var body = Data()
-
         for (key, value) in fields {
             body.append("--\(boundary)\r\n".data(using: .utf8)!)
             body.append("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n".data(using: .utf8)!)
             body.append("\(value)\r\n".data(using: .utf8)!)
         }
-
         for filePath in files {
             let url = URL(fileURLWithPath: filePath)
             let filename = url.lastPathComponent
-            let mimetype = "image/jpeg" // TODO: Detect mime if needed
+            let mimetype = "image/jpeg" // TODO: detect MIME dynamically if needed
 
             body.append("--\(boundary)\r\n".data(using: .utf8)!)
             body.append("Content-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\r\n".data(using: .utf8)!)
@@ -97,13 +112,11 @@ public class IosBackgroundUploaderPlugin: NSObject, FlutterPlugin, URLSessionDel
             }
             body.append("\r\n".data(using: .utf8)!)
         }
-
         body.append("--\(boundary)--\r\n".data(using: .utf8)!)
         return body
     }
 
     // MARK: - URLSession Delegates
-
     public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         let taskId = dataTask.taskIdentifier
         if responseDataMap[taskId] == nil {
@@ -130,37 +143,38 @@ public class IosBackgroundUploaderPlugin: NSObject, FlutterPlugin, URLSessionDel
         let responseBody = responseDataMap[taskId].flatMap { String(data: $0, encoding: .utf8) } ?? ""
         responseDataMap.removeValue(forKey: taskId)
 
-        if let error = error {
-            DispatchQueue.main.async {
+        DispatchQueue.main.async {
+            if let error = error {
                 IosBackgroundUploaderPlugin.eventSink?([
                     "status": "failed",
                     "error": error.localizedDescription,
                     "tag": task.taskDescription ?? ""
                 ])
-            }
-        } else {
-            if let httpResponse = task.response as? HTTPURLResponse {
-                DispatchQueue.main.async {
-                    IosBackgroundUploaderPlugin.eventSink?([
-                        "status": "completed",
-                        "code": httpResponse.statusCode,
-                        "response": responseBody,
-                        "tag": task.taskDescription ?? ""
-                    ])
-                }
+            } else if let httpResponse = task.response as? HTTPURLResponse {
+                IosBackgroundUploaderPlugin.eventSink?([
+                    "status": "completed",
+                    "code": httpResponse.statusCode,
+                    "response": responseBody,
+                    "tag": task.taskDescription ?? ""
+                ])
             } else {
-                DispatchQueue.main.async {
-                    IosBackgroundUploaderPlugin.eventSink?([
-                        "status": "completed",
-                        "response": responseBody,
-                        "tag": task.taskDescription ?? ""
-                    ])
-                }
+                IosBackgroundUploaderPlugin.eventSink?([
+                    "status": "completed",
+                    "response": responseBody,
+                    "tag": task.taskDescription ?? ""
+                ])
+            }
+
+            // MARK: Call background session completion handler safely
+            if let handler = IosBackgroundUploaderPlugin.backgroundSessionCompletionHandler {
+                handler()
+                IosBackgroundUploaderPlugin.backgroundSessionCompletionHandler = nil
             }
         }
     }
 }
 
+// MARK: - Flutter Stream Handler
 extension IosBackgroundUploaderPlugin: FlutterStreamHandler {
     public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
         IosBackgroundUploaderPlugin.eventSink = events
@@ -172,3 +186,4 @@ extension IosBackgroundUploaderPlugin: FlutterStreamHandler {
         return nil
     }
 }
+
