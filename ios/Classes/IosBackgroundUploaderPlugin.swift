@@ -7,6 +7,7 @@ public class IosBackgroundUploaderPlugin: NSObject, FlutterPlugin, URLSessionDel
     private var backgroundSession: URLSession!
     private static var eventSink: FlutterEventSink?
     private var responseDataMap = [Int: Data]() // Store data per task
+    private var activeTasks = 0 // Track number of in-flight tasks
 
     // Static property to store the background session completion handler
     public static var backgroundSessionCompletionHandler: (() -> Void)?
@@ -27,8 +28,17 @@ public class IosBackgroundUploaderPlugin: NSObject, FlutterPlugin, URLSessionDel
         let config = URLSessionConfiguration.background(withIdentifier: "com.desireweb.iosuploader.customUploader")
         config.isDiscretionary = false
         config.allowsCellularAccess = true
-        config.httpMaximumConnectionsPerHost = 100
+        // Limit parallel connections per host to avoid overwhelming the server
+        config.httpMaximumConnectionsPerHost = 6
         config.sessionSendsLaunchEvents = true
+        // Wait for connectivity instead of failing immediately on transient network loss
+        if #available(iOS 11.0, *) {
+            config.waitsForConnectivity = true
+        }
+        // Timeout for each request attempt (5 minutes — allows large files on slow networks)
+        config.timeoutIntervalForRequest = 300
+        // Total time allowed for the upload resource (1 hour — prevents indefinite hanging)
+        config.timeoutIntervalForResource = 3600
         backgroundSession = URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }
 
@@ -80,12 +90,14 @@ public class IosBackgroundUploaderPlugin: NSObject, FlutterPlugin, URLSessionDel
                 print("Error writing body: \(error)")
                 return
             }
+            activeTasks += 1
             let uploadTask = backgroundSession.uploadTask(with: request, fromFile: bodyFileURL)
             uploadTask.taskDescription = tag
             uploadTask.resume()
         } else if let filePath = files.first {
             // Single file upload
             let fileURL = URL(fileURLWithPath: filePath)
+            activeTasks += 1
             let uploadTask = backgroundSession.uploadTask(with: request, fromFile: fileURL)
             uploadTask.taskDescription = tag
             uploadTask.resume()
@@ -142,6 +154,7 @@ public class IosBackgroundUploaderPlugin: NSObject, FlutterPlugin, URLSessionDel
         let taskId = task.taskIdentifier
         let responseBody = responseDataMap[taskId].flatMap { String(data: $0, encoding: .utf8) } ?? ""
         responseDataMap.removeValue(forKey: taskId)
+        activeTasks = max(0, activeTasks - 1)
 
         DispatchQueue.main.async {
             if let error = error {
@@ -164,12 +177,42 @@ public class IosBackgroundUploaderPlugin: NSObject, FlutterPlugin, URLSessionDel
                     "tag": task.taskDescription ?? ""
                 ])
             }
+        }
+    }
 
-            // MARK: Call background session completion handler safely
+    // MARK: - Background Session Lifecycle
+    // Called when ALL background tasks for this session have completed.
+    // This is the correct place to call the completion handler — not per-task.
+    public func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        DispatchQueue.main.async {
             if let handler = IosBackgroundUploaderPlugin.backgroundSessionCompletionHandler {
                 handler()
                 IosBackgroundUploaderPlugin.backgroundSessionCompletionHandler = nil
             }
+        }
+    }
+
+    // Called when the session becomes invalid (e.g. due to error or explicit invalidation)
+    public func urlSession(_ session: URLSession, didBecomeInvalidWithError error: Error?) {
+        if let error = error {
+            print("[IosBackgroundUploader] Session invalidated with error: \(error.localizedDescription)")
+        }
+        DispatchQueue.main.async {
+            if let handler = IosBackgroundUploaderPlugin.backgroundSessionCompletionHandler {
+                handler()
+                IosBackgroundUploaderPlugin.backgroundSessionCompletionHandler = nil
+            }
+        }
+    }
+
+    // Called when waitsForConnectivity is enabled and the session is waiting
+    @available(iOS 11.0, *)
+    public func urlSession(_ session: URLSession, taskIsWaitingForConnectivity task: URLSessionTask) {
+        DispatchQueue.main.async {
+            IosBackgroundUploaderPlugin.eventSink?([
+                "status": "waiting_for_connectivity",
+                "tag": task.taskDescription ?? ""
+            ])
         }
     }
 }
@@ -186,4 +229,3 @@ extension IosBackgroundUploaderPlugin: FlutterStreamHandler {
         return nil
     }
 }
-
