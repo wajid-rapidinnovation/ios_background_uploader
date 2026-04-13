@@ -35,11 +35,20 @@ public class IosBackgroundUploaderPlugin: NSObject, FlutterPlugin, URLSessionDel
         if #available(iOS 11.0, *) {
             config.waitsForConnectivity = true
         }
+        // Keep network connection alive longer when entering background
+        config.shouldUseExtendedBackgroundIdleMode = true
         // Timeout for each request attempt (5 minutes — allows large files on slow networks)
         config.timeoutIntervalForRequest = 300
         // Total time allowed for the upload resource (1 hour — prevents indefinite hanging)
         config.timeoutIntervalForResource = 3600
-        backgroundSession = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+
+        // Dedicated delegate queue with elevated QoS for faster callback processing
+        let delegateQueue = OperationQueue()
+        delegateQueue.name = "com.desireweb.iosuploader.delegateQueue"
+        delegateQueue.qualityOfService = .userInitiated
+        delegateQueue.maxConcurrentOperationCount = 1
+
+        backgroundSession = URLSession(configuration: config, delegate: self, delegateQueue: delegateQueue)
     }
 
     // MARK: - Method Call Handling
@@ -93,6 +102,8 @@ public class IosBackgroundUploaderPlugin: NSObject, FlutterPlugin, URLSessionDel
             activeTasks += 1
             let uploadTask = backgroundSession.uploadTask(with: request, fromFile: bodyFileURL)
             uploadTask.taskDescription = tag
+            // High priority so iOS doesn't deprioritize our uploads in background
+            uploadTask.priority = URLSessionTask.highPriority
             uploadTask.resume()
         } else if let filePath = files.first {
             // Single file upload
@@ -100,6 +111,7 @@ public class IosBackgroundUploaderPlugin: NSObject, FlutterPlugin, URLSessionDel
             activeTasks += 1
             let uploadTask = backgroundSession.uploadTask(with: request, fromFile: fileURL)
             uploadTask.taskDescription = tag
+            uploadTask.priority = URLSessionTask.highPriority
             uploadTask.resume()
         }
     }
